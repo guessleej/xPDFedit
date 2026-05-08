@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- 背景圓角矩形 -->
+  <rect width="32" height="32" rx="7" fill="#C41230"/>
+  <!-- 文件堆疊圖示 (FileStack 風格) -->
+  <!-- 底層文件 -->
+  <rect x="7" y="13" width="14" height="13" rx="1.5" fill="white" opacity="0.35"/>
+  <!-- 中層文件 -->
+  <rect x="9" y="10" width="14" height="13" rx="1.5" fill="white" opacity="0.6"/>
+  <!-- 頂層文件 -->
+  <rect x="11" y="7" width="14" height="13" rx="1.5" fill="white"/>
+  <!-- 文件線條 -->
+  <line x1="14" y1="11" x2="22" y2="11" stroke="#C41230" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="14" y1="13.5" x2="22" y2="13.5" stroke="#C41230" stroke-width="1.2" stroke-linecap="round"/>
+  <line x1="14" y1="16" x2="19" y2="16" stroke="#C41230" stroke-width="1.2" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,223 @@
+version: "3.9"
+
+# xCloudPDF 開發環境
+# 云碩科技 CloudInfo Technology
+
+x-common-env: &common-env
+  POSTGRES_URL: postgresql+asyncpg://xcloud:xcloud@postgres:5432/xcloudpdf
+  REDIS_URL: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: minioadmin
+  MINIO_SECRET_KEY: minioadmin
+  MINIO_SECURE: "false"
+  ELASTICSEARCH_URL: http://elasticsearch:9200
+  JWT_SECRET: dev-secret-change-in-prod
+  DEBUG: "true"
+
+services:
+  # ─── 基礎設施 ────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: xcloud
+      POSTGRES_PASSWORD: xcloud
+      POSTGRES_DB: xcloudpdf
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─── API 閘道 ─────────────────────────────────────────────
+  gateway:
+    image: nginx:1.25-alpine
+    volumes:
+      - ./gateway/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway/nginx/conf.d:/etc/nginx/conf.d:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - auth
+      - document
+      - job-api
+      - audit
+      - admin
+      - ai
+
+  # ─── 應用服務 ─────────────────────────────────────────────
+  auth:
+    build: ../services/auth
+    environment:
+      <<: *common-env
+      SERVICE_NAME: auth
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  document:
+    build: ../services/document
+    environment:
+      <<: *common-env
+      SERVICE_NAME: document
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  job-api:
+    build: ../services/job
+    environment:
+      <<: *common-env
+      SERVICE_NAME: job
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  audit:
+    build: ../services/audit
+    environment:
+      <<: *common-env
+      SERVICE_NAME: audit
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  admin:
+    build: ../services/admin
+    environment:
+      <<: *common-env
+      SERVICE_NAME: admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ai:
+    build: ../services/ai
+    environment:
+      <<: *common-env
+      SERVICE_NAME: ai
+      LLM_PROVIDER: ollama
+      LLM_ENDPOINT: http://host.docker.internal:11434
+
+  notify:
+    build: ../services/notify
+    environment:
+      <<: *common-env
+      SERVICE_NAME: notify
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ─── Celery Workers ──────────────────────────────────────
+  worker-document:
+    build: ../services/document
+    command: celery -A app.worker worker -Q high,normal,batch -c 4 -l info
+    environment:
+      <<: *common-env
+      SERVICE_NAME: worker-document
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker-ai:
+    build: ../services/ai
+    command: celery -A app.worker worker -Q ai -c 2 -l info
+    environment:
+      <<: *common-env
+      SERVICE_NAME: worker-ai
+
+  # ─── 前端 ────────────────────────────────────────────────
+  frontend:
+    build: ../frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_BASE_URL: http://localhost/api/v1
+
+  # ─── 監控 ────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  es_data:
+  grafana_data:

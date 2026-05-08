@@ -1,0 +1,255 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  xPDFedit — DGX Spark 生產部署
+#  架構：NVIDIA Grace Blackwell (aarch64/ARM64)
+#  啟動：docker compose -f docker-compose.dgx.yml up -d
+# ════════════════════════════════════════════════════════════════════════════
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "5"
+    compress: "true"
+
+x-restart: &always-restart
+  restart: always
+
+services:
+
+  # ── PostgreSQL 16（核心交易資料庫）────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    platform: linux/arm64
+    container_name: xpdfedit-postgres
+    <<: *always-restart
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xcloud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?請在 .env 設定 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-xpdfedit}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xcloud} -d ${POSTGRES_DB:-xpdfedit}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # ── Redis 7（快取 / 作業佇列 / Session）──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    platform: linux/arm64
+    container_name: xpdfedit-redis
+    <<: *always-restart
+    logging: *default-logging
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?請在 .env 設定 REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ── 後端 API（Gunicorn + Uvicorn workers）────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: xpdfedit-backend:${VERSION:-latest}
+    platform: linux/arm64
+    container_name: xpdfedit-backend
+    <<: *always-restart
+    logging: *default-logging
+    command: >
+      gunicorn app.main:app
+      --workers ${GUNICORN_WORKERS:-4}
+      --worker-class uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 300
+      --graceful-timeout 30
+      --keep-alive 5
+      --access-logfile -
+      --error-logfile -
+      --log-level ${LOG_LEVEL:-info}
+    environment:
+      # 資料庫
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-xcloud}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-xpdfedit}
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      # 安全
+      SECRET_KEY: ${SECRET_KEY:?請在 .env 設定 SECRET_KEY（至少 32 字元）}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      DEBUG: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 儲存
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_PATH: /app/data/storage
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-500}
+      # 允許來源
+      ALLOWED_ORIGINS: '["http://${DGX_HOST:-localhost}", "https://${DGX_HOST:-localhost}", "http://${DGX_HOST:-localhost}:${PORT:-80}"]'
+      # LibreOffice
+      LIBREOFFICE_PATH: /usr/bin/libreoffice
+      # 保留期限
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-90}
+      FILE_RETENTION_DAYS: ${FILE_RETENTION_DAYS:-14}
+    volumes:
+      - backend_data:/app/data
+    networks:
+      - backend-net
+      - frontend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "${BACKEND_CPU_LIMIT:-8}"
+          memory: ${BACKEND_MEM_LIMIT:-8G}
+        reservations:
+          cpus: "2"
+          memory: 2G
+    # DGX GPU 支援（AI 工具啟用時取消註解）
+    # runtime: nvidia
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+
+  # ── 前端 SPA（Nginx 靜態服務）────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: xpdfedit-frontend:${VERSION:-latest}
+    platform: linux/arm64
+    container_name: xpdfedit-frontend
+    <<: *always-restart
+    logging: *default-logging
+    networks:
+      - frontend-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  # ── Nginx（反向代理 / API 閘道）──────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    platform: linux/arm64
+    container_name: xpdfedit-nginx
+    <<: *always-restart
+    logging: *default-logging
+    ports:
+      - "${PORT:-80}:80"
+      - "${SSL_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.dgx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro               # SSL 憑證目錄
+      - nginx_cache:/var/cache/nginx
+      - nginx_logs:/var/log/nginx
+    networks:
+      - frontend-net
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  # ── Backup（定期備份 PostgreSQL + 資料）──────────────────────────────────
+  backup:
+    image: postgres:16
+    platform: linux/arm64
+    container_name: xpdfedit-backup
+    restart: "no"
+    profiles: ["backup"]           # 只在 --profile backup 時啟動
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+      - ./deploy/backup.sh:/backup.sh:ro
+    networks:
+      - backend-net
+    entrypoint: ["/bin/bash", "/backup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# ── 網路 ──────────────────────────────────────────────────────────────────────
+networks:
+  backend-net:
+    driver: bridge
+    name: xpdfedit-backend
+  frontend-net:
+    driver: bridge
+    name: xpdfedit-frontend
+
+# ── 持久化 Volume ──────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/opt/xpdfedit}/postgres
+
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/opt/xpdfedit}/redis
+
+  backend_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_DIR:-/opt/xpdfedit}/app-data
+
+  nginx_cache:
+    driver: local
+  nginx_logs:
+    driver: local
