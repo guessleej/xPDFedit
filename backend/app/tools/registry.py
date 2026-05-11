@@ -309,10 +309,14 @@ class PdfWatermarkTool(ToolBase):
             output_path = workdir / f"watermarked_{input_path.name}"
             doc = fitz.open(str(input_path))
             for page in doc:
+                center = fitz.Point(page.rect.width / 2, page.rect.height / 2)
+                rot_mat = fitz.Matrix(1, 0, 0, 1, 0, 0).prerotate(angle)
                 page.insert_text(
-                    point=(page.rect.width / 2, page.rect.height / 2),
+                    center,
                     text=text, fontsize=48, color=color,
-                    rotate=angle, render_mode=3,
+                    fill_opacity=opacity,
+                    morph=(center, rot_mat),
+                    render_mode=0,
                 )
             doc.save(str(output_path))
             doc.close()
@@ -732,8 +736,9 @@ class PdfToImageTool(ToolBase):
                     else:
                         pix.pil_save(str(img_path), format="JPEG", quality=85)
                     zf.write(str(img_path), fname)
+            page_count = len(doc)
             doc.close()
-            return ToolResult(True, output_zip, output_zip.name, "application/zip", metadata={"page_count": len(doc)})
+            return ToolResult(True, output_zip, output_zip.name, "application/zip", metadata={"page_count": page_count})
         except Exception as e:
             return ToolResult(False, error=str(e))
 

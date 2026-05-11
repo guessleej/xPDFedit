@@ -83,27 +83,33 @@ async def _run_job(job_id: str, tool_id: str, input_path: str, params: dict):
     from ..database import AsyncSessionLocal
 
     workdir = Path(tempfile.mkdtemp(prefix=f"job_{job_id}_"))
-    try:
+    now = datetime.now(timezone.utc)
+
+    async def _set_job(**kwargs):
+        """在新 session 裡更新 Job，使用 column 物件為 key 避免 property 解析問題。"""
+        col_map = {
+            "status":         Job.status,
+            "started_at":     Job.started_at,
+            "finished_at":    Job.finished_at,
+            "progress":       Job.progress,
+            "error_message":  Job.error_message,
+            "output_path":    Job.output_path,
+            "output_filename":Job.output_filename,
+            "content_type":   Job.content_type,
+            "job_metadata":   Job.metadata_,
+        }
+        values = {col_map[k]: v for k, v in kwargs.items() if k in col_map}
         async with AsyncSessionLocal() as db:
-            await db.execute(
-                update(Job).where(Job.id == job_id).values(
-                    status="running",
-                    started_at=datetime.now(timezone.utc),
-                    progress=10,
-                )
-            )
+            await db.execute(update(Job).where(Job.id == job_id).values(values))
             await db.commit()
+
+    try:
+        await _set_job(status="running", started_at=datetime.now(timezone.utc), progress=10)
 
         tool = TOOL_REGISTRY.get(tool_id)
         if not tool:
-            async with AsyncSessionLocal() as db:
-                await db.execute(
-                    update(Job).where(Job.id == job_id).values(
-                        status="failed", error_message=f"工具 {tool_id} 不存在",
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                )
-                await db.commit()
+            await _set_job(status="failed", error_message=f"工具 {tool_id} 不存在",
+                           finished_at=datetime.now(timezone.utc))
             return
 
         inp_path = Path(input_path) if input_path else workdir / "dummy"
@@ -114,74 +120,48 @@ async def _run_job(job_id: str, tool_id: str, input_path: str, params: dict):
             lambda: asyncio.run(tool.execute(inp_path, params, workdir))
         )
 
+        # 執行完成前先確認 DB 狀態是否被外部取消
         async with AsyncSessionLocal() as db:
-            # 執行完成前先確認 DB 狀態是否被外部取消
             current = (await db.execute(
                 select(Job.status).where(Job.id == job_id)
             )).scalar_one_or_none()
+        if current == "cancelled":
+            return
 
-            if current == "cancelled":
-                return  # 外部已取消，不更新結果
-
-            if result.success and result.output_path:
-                out_dir = OUTPUT_DIR / job_id
-                out_dir.mkdir(parents=True, exist_ok=True)
-                dest = out_dir / (result.output_filename or result.output_path.name)
-                shutil.copy2(str(result.output_path), str(dest))
-                await db.execute(
-                    update(Job).where(Job.id == job_id).values(
-                        status="done",
-                        output_path=str(dest),
-                        output_filename=dest.name,
-                        content_type=result.content_type,
-                        progress=100,
-                        metadata_=result.metadata,
-                        finished_at=datetime.now(timezone.utc),
-                        duration_seconds=int(
-                            (datetime.now(timezone.utc) -
-                             (await db.execute(select(Job.started_at).where(Job.id == job_id))).scalar_one()).total_seconds()
-                        ) if False else None,  # 簡化，不重算
-                    )
-                )
-            else:
-                await db.execute(
-                    update(Job).where(Job.id == job_id).values(
-                        status="failed",
-                        error_message=result.error or result.message,
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                )
-            await db.commit()
+        if result.success and result.output_path:
+            out_dir = OUTPUT_DIR / job_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dest = out_dir / (result.output_filename or result.output_path.name)
+            shutil.copy2(str(result.output_path), str(dest))
+            await _set_job(
+                status="done",
+                output_path=str(dest),
+                output_filename=dest.name,
+                content_type=result.content_type,
+                progress=100,
+                job_metadata=result.metadata,
+                finished_at=datetime.now(timezone.utc),
+            )
+        else:
+            await _set_job(
+                status="failed",
+                error_message=result.error or result.message,
+                finished_at=datetime.now(timezone.utc),
+            )
 
     except asyncio.CancelledError:
-        # Task 被強制取消 → 更新 DB 狀態
         logger.info("Job %s: cancelled by user", job_id)
         try:
-            async with AsyncSessionLocal() as db:
-                await db.execute(
-                    update(Job).where(Job.id == job_id).values(
-                        status="cancelled",
-                        error_message="由使用者強制取消",
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                )
-                await db.commit()
+            await _set_job(status="cancelled", error_message="由使用者強制取消",
+                           finished_at=datetime.now(timezone.utc))
         except Exception:
             pass
-        # 不重新拋出，讓 finally 清理
 
     except Exception as e:
         logger.exception("Job %s 執行失敗", job_id)
         try:
-            async with AsyncSessionLocal() as db:
-                await db.execute(
-                    update(Job).where(Job.id == job_id).values(
-                        status="failed",
-                        error_message=str(e),
-                        finished_at=datetime.now(timezone.utc),
-                    )
-                )
-                await db.commit()
+            await _set_job(status="failed", error_message=str(e),
+                           finished_at=datetime.now(timezone.utc))
         except Exception:
             pass
     finally:
