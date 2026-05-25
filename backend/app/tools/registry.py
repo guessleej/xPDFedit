@@ -1207,6 +1207,424 @@ class PdfToExcelTool(ToolBase):
             return ToolResult(False, error=str(e))
 
 
+# ─── AI 共用函式 ─────────────────────────────────────────────────────────────
+
+async def _llm_chat(system: str, user: str, model: str | None = None) -> str:
+    """呼叫 OpenAI-compatible LLM API，回傳文字回應"""
+    from app.config import settings
+    import httpx
+    if not settings.llm_base_url:
+        raise RuntimeError("尚未設定 LLM_BASE_URL")
+    base = settings.llm_base_url.rstrip("/")
+    m = model or settings.llm_model
+    async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
+        resp = await client.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+            json={"model": m, "temperature": 0.3,
+                  "messages": [{"role": "system", "content": system},
+                                {"role": "user",   "content": user}]},
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+async def _get_embedding(text: str) -> list[float]:
+    """透過 Ollama embed API 取得 bge-m3 向量（1024 維）"""
+    from app.config import settings
+    import httpx
+    ollama_base = settings.llm_base_url.rstrip("/").replace("/v1", "")
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{ollama_base}/api/embed",
+            json={"model": settings.embedding_model, "input": text},
+        )
+        resp.raise_for_status()
+        return resp.json()["embeddings"][0]
+
+
+# ─── AI 工具 1：PDF 智慧摘要 ─────────────────────────────────────────────────
+
+class PdfSummarizeTool(ToolBase):
+    tool_id = "pdf-summarize"
+    name_zh = "PDF 智慧摘要"
+    name_en = "PDF Summarize"
+    description_zh = "用 AI 對 PDF 生成結構化重點摘要，支援全文或逐頁模式"
+    category = "ai"
+    icon = "BrainCircuit"
+    color = "violet"
+    tags = ["AI", "摘要", "LLM"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("mode", "select", "摘要模式", required=False, default="full",
+                      options=[{"label": "全文摘要（整份文件）", "value": "full"},
+                               {"label": "逐頁摘要",            "value": "page"}]),
+            ToolParam("language", "select", "輸出語言", required=False, default="zh-tw",
+                      options=[{"label": "繁體中文", "value": "zh-tw"},
+                               {"label": "English", "value": "en"},
+                               {"label": "與原文相同", "value": "auto"}]),
+            ToolParam("output_format", "select", "輸出格式", required=False, default="md",
+                      options=[{"label": "Markdown (.md)", "value": "md"},
+                               {"label": "純文字 (.txt)",  "value": "txt"}]),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz
+            from app.config import settings
+            if not settings.llm_base_url:
+                return ToolResult(False, error="尚未設定 LLM 服務（LLM_BASE_URL）")
+
+            mode   = params.get("mode", "full")
+            lang   = params.get("language", "zh-tw")
+            fmt    = params.get("output_format", "md")
+            lang_label = {"zh-tw": "繁體中文", "en": "English", "auto": "與原文相同語言"}.get(lang, "繁體中文")
+            system = (f"你是專業文件分析師。請用{lang_label}輸出重點摘要，"
+                      "條列式呈現，結構清晰，不要多餘解釋。")
+
+            doc = fitz.open(str(input_path))
+            pages_text = [page.get_text() for page in doc]
+            page_count = len(doc)
+            doc.close()
+
+            blocks: list[str] = []
+            if mode == "page":
+                for i, text in enumerate(pages_text):
+                    if not text.strip():
+                        blocks.append(f"## 第 {i+1} 頁\n\n（無文字內容）\n")
+                        continue
+                    summary = await _llm_chat(system,
+                        f"PDF 第 {i+1} 頁內容如下，請生成重點摘要：\n\n{text[:3000]}",
+                        model=settings.summary_model)
+                    blocks.append(f"## 第 {i+1} 頁\n\n{summary}\n")
+            else:
+                all_text = "\n\n".join(pages_text)
+                if len(all_text) > 14000:
+                    all_text = all_text[:14000] + "\n\n[...內容過長，已截斷...]"
+                summary = await _llm_chat(system,
+                    f"以下是 PDF 完整內容，請生成結構化重點摘要：\n\n{all_text}",
+                    model=settings.summary_model)
+                blocks.append(summary)
+
+            body = "\n".join(blocks)
+            if fmt == "md":
+                content = f"# {input_path.stem}　摘要\n\n{body}"
+                out_name = f"{input_path.stem}_summary.md"
+                ct = "text/markdown"
+            else:
+                content = body
+                out_name = f"{input_path.stem}_summary.txt"
+                ct = "text/plain"
+
+            out = workdir / out_name
+            out.write_text(content, encoding="utf-8")
+            return ToolResult(True, out, out_name, ct,
+                              metadata={"pages": page_count, "mode": mode,
+                                        "model": settings.summary_model})
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
+# ─── AI 工具 2：PDF 問答（RAG） ──────────────────────────────────────────────
+
+class PdfQATool(ToolBase):
+    tool_id = "pdf-qa"
+    name_zh = "PDF 問答"
+    name_en = "PDF Q&A"
+    description_zh = "對 PDF 內容提問，AI 根據文件內容回答（RAG）"
+    category = "ai"
+    icon = "MessageSquareText"
+    color = "blue"
+    tags = ["AI", "問答", "RAG", "LLM"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("question", "string", "你的問題", required=True,
+                      placeholder="這份文件的主要結論是什麼？"),
+            ToolParam("model", "select", "使用模型", required=False, default="qwen",
+                      options=[{"label": "Qwen3.6 35B（推理強，較慢）", "value": "qwen"},
+                               {"label": "Gemma4（速度快）",             "value": "gemma"}]),
+            ToolParam("output_format", "select", "輸出格式", required=False, default="md",
+                      options=[{"label": "Markdown (.md)", "value": "md"},
+                               {"label": "純文字 (.txt)",  "value": "txt"}]),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz
+            from app.config import settings
+            if not settings.llm_base_url:
+                return ToolResult(False, error="尚未設定 LLM 服務（LLM_BASE_URL）")
+
+            question = params.get("question", "").strip()
+            if not question:
+                return ToolResult(False, error="請輸入問題")
+
+            model = (settings.rag_model
+                     if params.get("model", "qwen") == "qwen"
+                     else settings.summary_model)
+            fmt = params.get("output_format", "md")
+
+            doc = fitz.open(str(input_path))
+            chunks = []
+            for i, page in enumerate(doc):
+                t = page.get_text().strip()
+                if t:
+                    chunks.append(f"[第{i+1}頁]\n{t}")
+            page_count = len(doc)
+            doc.close()
+
+            context = "\n\n".join(chunks)
+            if len(context) > 16000:
+                context = context[:16000] + "\n\n[...已截斷...]"
+
+            system = ("你是專業文件分析助理。請根據提供的文件內容回答問題，"
+                      "引用頁碼佐證。若文件中找不到答案請直接說明，不要編造。")
+            answer = await _llm_chat(system,
+                f"文件內容：\n\n{context}\n\n---\n\n問題：{question}",
+                model=model)
+
+            if fmt == "md":
+                content = (f"# PDF 問答\n\n"
+                           f"**問題：** {question}\n\n"
+                           f"**回答：**\n\n{answer}\n\n"
+                           f"---\n*使用模型：{model}*")
+                out_name = f"{input_path.stem}_qa.md"
+                ct = "text/markdown"
+            else:
+                content = f"問題：{question}\n\n回答：\n{answer}"
+                out_name = f"{input_path.stem}_qa.txt"
+                ct = "text/plain"
+
+            out = workdir / out_name
+            out.write_text(content, encoding="utf-8")
+            return ToolResult(True, out, out_name, ct,
+                              metadata={"pages": page_count, "model": model,
+                                        "question": question[:60]})
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
+# ─── AI 工具 3：關鍵字 / 標籤擷取 ───────────────────────────────────────────
+
+class PdfKeywordsTool(ToolBase):
+    tool_id = "pdf-keywords"
+    name_zh = "關鍵字擷取"
+    name_en = "Keyword Extraction"
+    description_zh = "AI 自動擷取文件主題關鍵字、人名、組織名稱等實體"
+    category = "ai"
+    icon = "Tags"
+    color = "amber"
+    tags = ["AI", "關鍵字", "NLP", "實體識別"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("extract_topics", "boolean", "主題關鍵字", required=False, default=True),
+            ToolParam("extract_people", "boolean", "人名",       required=False, default=True),
+            ToolParam("extract_orgs",   "boolean", "組織/機構",  required=False, default=True),
+            ToolParam("extract_dates",  "boolean", "日期/時間",  required=False, default=False),
+            ToolParam("output_format", "select", "輸出格式", required=False, default="md",
+                      options=[{"label": "Markdown (.md)", "value": "md"},
+                               {"label": "JSON (.json)",   "value": "json"}]),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz, json
+            from app.config import settings
+            if not settings.llm_base_url:
+                return ToolResult(False, error="尚未設定 LLM 服務（LLM_BASE_URL）")
+
+            want_topics = params.get("extract_topics", True)
+            want_people = params.get("extract_people", True)
+            want_orgs   = params.get("extract_orgs", True)
+            want_dates  = params.get("extract_dates", False)
+            fmt         = params.get("output_format", "md")
+
+            doc = fitz.open(str(input_path))
+            all_text = " ".join(p.get_text() for p in doc)[:12000]
+            page_count = len(doc)
+            doc.close()
+
+            # 建立 JSON schema prompt
+            schema_parts = []
+            if want_topics: schema_parts.append('"topics": ["主題詞1", ...]')
+            if want_people: schema_parts.append('"people": ["人名1", ...]')
+            if want_orgs:   schema_parts.append('"organizations": ["組織1", ...]')
+            if want_dates:  schema_parts.append('"dates": ["日期1", ...]')
+
+            system = "你是資訊擷取專家。請從文件中擷取指定實體，嚴格以 JSON 格式輸出，不要輸出其他文字。"
+            prompt = (f"請擷取以下實體：\n輸出格式：{{ {', '.join(schema_parts)} }}\n\n"
+                      f"文件內容：\n{all_text}")
+
+            raw = await _llm_chat(system, prompt, model=settings.summary_model)
+
+            # 解析 JSON
+            try:
+                s = raw.find("{"); e = raw.rfind("}") + 1
+                data: dict = json.loads(raw[s:e])
+            except Exception:
+                data = {"raw": raw}
+
+            total_items = sum(len(v) for v in data.values() if isinstance(v, list))
+
+            if fmt == "json":
+                out_name = f"{input_path.stem}_keywords.json"
+                out = workdir / out_name
+                out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                ct = "application/json"
+            else:
+                label_map = {"topics": "主題關鍵字", "people": "人名",
+                             "organizations": "組織/機構", "dates": "日期/時間"}
+                lines = [f"# {input_path.stem}　關鍵字分析\n"]
+                for k, lbl in label_map.items():
+                    if k in data and data[k]:
+                        lines.append(f"## {lbl}")
+                        lines += [f"- {v}" for v in data[k]]
+                        lines.append("")
+                if "raw" in data:
+                    lines.append(f"## 擷取結果\n\n{data['raw']}")
+                out_name = f"{input_path.stem}_keywords.md"
+                out = workdir / out_name
+                out.write_text("\n".join(lines), encoding="utf-8")
+                ct = "text/markdown"
+
+            return ToolResult(True, out, out_name, ct,
+                              metadata={"pages": page_count, "items_found": total_items,
+                                        "model": settings.summary_model})
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
+# ─── AI 工具 4：語意索引（bge-m3 + Elasticsearch） ──────────────────────────
+
+class PdfSemanticIndexTool(ToolBase):
+    tool_id = "pdf-semantic-index"
+    name_zh = "語意索引"
+    name_en = "Semantic Index"
+    description_zh = "用 bge-m3 向量化 PDF 內容並存入 Elasticsearch，供語意搜尋使用"
+    category = "ai"
+    icon = "Database"
+    color = "teal"
+    tags = ["AI", "語意搜尋", "Embeddings", "Elasticsearch"]
+
+    ES_INDEX = "xcloudpdf_semantic"
+    CHUNK_SIZE = 400   # 每段最大字數
+    DIMS = 1024        # bge-m3 向量維度
+
+    async def _ensure_index(self, es):
+        """建立 ES 索引（若不存在）"""
+        if not es.indices.exists(index=self.ES_INDEX):
+            es.indices.create(index=self.ES_INDEX, body={
+                "mappings": {"properties": {
+                    "doc_id":   {"type": "keyword"},
+                    "filename": {"type": "keyword"},
+                    "page":     {"type": "integer"},
+                    "chunk":    {"type": "integer"},
+                    "text":     {"type": "text", "analyzer": "standard"},
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": self.DIMS,
+                        "index": True,
+                        "similarity": "cosine",
+                    },
+                }}
+            })
+
+    def _split_chunks(self, text: str) -> list[str]:
+        """依段落切分，每段最多 CHUNK_SIZE 字"""
+        paras = [p.strip() for p in text.split("\n") if p.strip()]
+        chunks, buf = [], ""
+        for p in paras:
+            if len(buf) + len(p) > self.CHUNK_SIZE and buf:
+                chunks.append(buf)
+                buf = p
+            else:
+                buf = (buf + " " + p).strip() if buf else p
+        if buf:
+            chunks.append(buf)
+        return chunks
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz, json, hashlib
+            from elasticsearch import Elasticsearch
+            from app.config import settings
+
+            es = Elasticsearch(settings.elasticsearch_url)
+            await asyncio.get_event_loop().run_in_executor(None, lambda: self._ensure_index_sync(es))
+
+            doc = fitz.open(str(input_path))
+            page_count = len(doc)
+            doc_id = hashlib.md5(input_path.name.encode()).hexdigest()[:12]
+            filename = input_path.name
+            total_chunks = 0
+
+            # 先刪除同檔案舊索引
+            es.delete_by_query(index=self.ES_INDEX,
+                               body={"query": {"term": {"doc_id": doc_id}}},
+                               ignore_unavailable=True)
+
+            for pg_i, page in enumerate(doc):
+                text = page.get_text().strip()
+                if not text:
+                    continue
+                chunks = self._split_chunks(text)
+                for ck_i, chunk in enumerate(chunks):
+                    vec = await _get_embedding(chunk)
+                    es.index(index=self.ES_INDEX, document={
+                        "doc_id":    doc_id,
+                        "filename":  filename,
+                        "page":      pg_i + 1,
+                        "chunk":     ck_i + 1,
+                        "text":      chunk,
+                        "embedding": vec,
+                    })
+                    total_chunks += 1
+
+            doc.close()
+
+            # 輸出摘要 JSON
+            summary = {
+                "doc_id": doc_id, "filename": filename,
+                "pages": page_count, "chunks_indexed": total_chunks,
+                "index": self.ES_INDEX,
+                "search_endpoint": "/api/v1/search/semantic",
+            }
+            out_name = f"{input_path.stem}_index_report.json"
+            out = workdir / out_name
+            out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            return ToolResult(True, out, out_name, "application/json",
+                              message=f"已索引 {total_chunks} 個段落，可至語意搜尋頁面查詢",
+                              metadata=summary)
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+    def _ensure_index_sync(self, es):
+        """同步版建立索引（供 run_in_executor 使用）"""
+        if not es.indices.exists(index=self.ES_INDEX):
+            es.indices.create(index=self.ES_INDEX, body={
+                "mappings": {"properties": {
+                    "doc_id":   {"type": "keyword"},
+                    "filename": {"type": "keyword"},
+                    "page":     {"type": "integer"},
+                    "chunk":    {"type": "integer"},
+                    "text":     {"type": "text"},
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": self.DIMS,
+                        "index": True,
+                        "similarity": "cosine",
+                    },
+                }}
+            })
+
+
 # ─── 輔助函數 ────────────────────────────────────────────────────────────────
 
 def _parse_page_range(s: str, total: int) -> list[int]:
@@ -1408,7 +1826,8 @@ _register(
     # Security
     DocDeidentTool(), AesZipTool(),
     # AI
-    TranslateDocTool(),
+    TranslateDocTool(), PdfSummarizeTool(), PdfQATool(),
+    PdfKeywordsTool(), PdfSemanticIndexTool(),
 )
 
 

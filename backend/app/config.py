@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     llm_model: str = "qwen2.5"
     llm_timeout: int = 120
 
+    # AI 進階設定
+    rag_model: str = "qwen3.6:35b"         # PDF 問答（推理強）
+    summary_model: str = "gemma4:e4b"       # 摘要 / 關鍵字（快）
+    embedding_model: str = "bge-m3:latest"  # 向量化
+
 
 @lru_cache
 def get_settings() -> Settings:

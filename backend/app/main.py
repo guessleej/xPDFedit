@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .database import init_db, AsyncSessionLocal
 from .core.init_data import seed_database
-from .routers import auth, tools, jobs, admin
+from .routers import auth, tools, jobs, admin, search
 
 logging.basicConfig(level=logging.DEBUG if settings.debug else logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -57,6 +57,7 @@ app.include_router(auth.router,   prefix="/api/v1/auth",   tags=["認證"])
 app.include_router(tools.router,  prefix="/api/v1/tools",  tags=["工具"])
 app.include_router(jobs.router,   prefix="/api/v1/jobs",   tags=["作業"])
 app.include_router(admin.router,  prefix="/api/v1/admin",  tags=["管理"])
+app.include_router(search.router, prefix="/api/v1/search", tags=["語意搜尋"])
 
 
 @app.get("/api/v1/health")
