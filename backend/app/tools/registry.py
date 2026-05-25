@@ -1090,67 +1090,41 @@ class PdfToPptxTool(ToolBase):
     tool_id = "pdf-to-pptx"
     name_zh = "PDF 轉 PowerPoint"
     name_en = "PDF to PPTX"
-    description_zh = "將 PDF 每頁轉換為 PowerPoint 投影片（.pptx）"
+    description_zh = "將 PDF 每頁轉換為可編輯的 PowerPoint 投影片（.pptx），保留文字與圖形"
     category = "convert"
     icon = "GalleryHorizontalEnd"
     color = "orange"
     tags = ["PDF", "轉換", "PowerPoint", "PPTX"]
 
-    @property
-    def params(self):
-        return [
-            ToolParam("dpi", "select", "投影片品質", required=False, default="150",
-                      options=[
-                          {"label": "標準（150 DPI，速度快）", "value": "150"},
-                          {"label": "高清（300 DPI，檔案較大）", "value": "300"},
-                      ]),
-        ]
-
     async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
         try:
-            import fitz, io
-            from pptx import Presentation
-            from pptx.util import Emu
+            import subprocess, os
+            import fitz
 
-            dpi = int(params.get("dpi", 150))
-            scale = dpi / 72
-            mat = fitz.Matrix(scale, scale)
+            doc_ref = fitz.open(str(input_path))
+            page_count = len(doc_ref)
+            doc_ref.close()
 
-            doc = fitz.open(str(input_path))
-            page_count = len(doc)
-            prs = Presentation()
+            lo_env = {**os.environ, "HOME": "/tmp"}
+            pptx_path = workdir / f"{input_path.stem}.pptx"
 
-            # PDF point → EMU（1 pt = 914400/72 = 12700 EMU）
-            PT_TO_EMU = 914400 / 72
-            MAX_EMU   = 51206400   # PPTX 最大 56 英寸
-            MIN_EMU   = 914400     # PPTX 最小 1 英寸
+            # LibreOffice Impress PDF 匯入濾鏡（可編輯投影片）
+            proc = subprocess.run(
+                ["libreoffice", "--headless",
+                 "--infilter=impress_pdf_import",
+                 "--convert-to", "pptx",
+                 "--outdir", str(workdir),
+                 str(input_path)],
+                capture_output=True, timeout=180, env=lo_env,
+            )
 
-            first = doc[0]
-            raw_w = first.rect.width  * PT_TO_EMU
-            raw_h = first.rect.height * PT_TO_EMU
-            # 若超出上限則等比縮放
-            shrink = min(1.0, MAX_EMU / max(raw_w, raw_h, 1))
-            slide_w = Emu(max(MIN_EMU, int(raw_w * shrink)))
-            slide_h = Emu(max(MIN_EMU, int(raw_h * shrink)))
-
-            prs.slide_width  = slide_w
-            prs.slide_height = slide_h
-            blank_layout = prs.slide_layouts[6]
-
-            for i, page in enumerate(doc):
-                slide = prs.slides.add_slide(blank_layout)
-                pix = page.get_pixmap(matrix=mat)
-                buf = io.BytesIO(pix.tobytes("png"))
-                slide.shapes.add_picture(buf, 0, 0, slide_w, slide_h)
-
-            doc.close()
-            output_path = workdir / f"{input_path.stem}.pptx"
-            prs.save(str(output_path))
+            if proc.returncode != 0 or not pptx_path.exists():
+                raise Exception(f"LibreOffice 轉換失敗：{proc.stderr.decode()[:300]}")
 
             return ToolResult(
-                True, output_path, output_path.name,
+                True, pptx_path, pptx_path.name,
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                metadata={"pages": page_count, "dpi": dpi},
+                metadata={"pages": page_count, "engine": "libreoffice"},
             )
         except Exception as e:
             return ToolResult(False, error=str(e))
@@ -1278,94 +1252,47 @@ class PdfToDocxTool(ToolBase):
 
     async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
         try:
-            import subprocess, zipfile, re, io
-            from pdf2docx import Converter
+            import subprocess, os
             import fitz
 
             output_format = params.get("output_format", "docx")
-            start = int(params.get("start_page", 0))
-            end_p = int(params.get("end_page", 0))
-            end = end_p if end_p > 0 else None
 
-            # 取得原始 PDF 頁數與文字量（用來判斷轉換品質）
             doc_ref = fitz.open(str(input_path))
             page_count = len(doc_ref)
-            original_chars = sum(len(doc_ref[i].get_text()) for i in range(page_count))
             doc_ref.close()
 
-            # ── Step 1：pdf2docx 嘗試轉換 ─────────────────────────
+            lo_env = {**os.environ, "HOME": "/tmp"}
             docx_path = workdir / f"{input_path.stem}.docx"
-            try:
-                cv = Converter(str(input_path))
-                cv.convert(str(docx_path), start=start, end=end)
-                cv.close()
-            except Exception as e:
-                logger.warning("pdf2docx 轉換失敗（%s），改用圖片嵌入模式", e)
 
-            # ── Step 2：檢查轉出品質 ──────────────────────────────
-            converted_chars = 0
-            if docx_path.exists():
-                try:
-                    with zipfile.ZipFile(str(docx_path)) as z:
-                        xml = z.read("word/document.xml").decode()
-                    texts = re.findall(r"<w:t[^>]*>([^<]+)</w:t>", xml)
-                    converted_chars = len("".join(texts).strip())
-                except Exception:
-                    pass
-
-            # 轉出字數不足原始的 30%（或 < 30 字），視為失敗 → 圖片嵌入模式
-            use_image = (
-                not docx_path.exists()
-                or converted_chars < 30
-                or (original_chars > 50 and converted_chars < original_chars * 0.3)
+            # ── Step 1：LibreOffice PDF 匯入濾鏡（可編輯文字/圖形） ──
+            proc = subprocess.run(
+                ["libreoffice", "--headless",
+                 "--infilter=writer_pdf_import",
+                 "--convert-to", "docx",
+                 "--outdir", str(workdir),
+                 str(input_path)],
+                capture_output=True, timeout=180, env=lo_env,
             )
+            engine = "libreoffice"
 
-            engine = "pdf2docx"
-            if use_image:
-                engine = "image-embed"
-                logger.info("PDF 轉 Word：改用圖片嵌入模式（原始 %d 字，轉出 %d 字）",
-                            original_chars, converted_chars)
-                from docx import Document as WordDoc
-                from docx.shared import Inches
-
-                doc_fitz = fitz.open(str(input_path))
-                word = WordDoc()
-                # 設定 A4 頁面，縮小邊距以容納整頁圖片
-                sec = word.sections[0]
-                sec.page_width  = Inches(8.27)
-                sec.page_height = Inches(11.69)
-                sec.left_margin = sec.right_margin = Inches(0.5)
-                sec.top_margin  = sec.bottom_margin = Inches(0.5)
-
-                start_idx = start
-                end_idx   = end if end is not None else page_count
-                indices   = list(range(start_idx, min(end_idx, page_count)))
-
-                for idx, pg_i in enumerate(indices):
-                    page = doc_fitz[pg_i]
-                    mat  = fitz.Matrix(2.0, 2.0)   # 144 DPI，品質足夠且不過大
-                    pix  = page.get_pixmap(matrix=mat)
-                    buf  = io.BytesIO(pix.tobytes("png"))
-
-                    para = word.add_paragraph()
-                    para.alignment = 1   # CENTER
-                    para.add_run().add_picture(buf, width=Inches(7.27))
-
-                    if idx < len(indices) - 1:
-                        word.add_page_break()
-
-                doc_fitz.close()
-                word.save(str(docx_path))
+            # ── Step 2：LibreOffice 失敗則 fallback pdf2docx ────────
+            if proc.returncode != 0 or not docx_path.exists():
+                logger.warning("LibreOffice 轉換失敗，改用 pdf2docx")
+                from pdf2docx import Converter
+                cv = Converter(str(input_path))
+                cv.convert(str(docx_path))
+                cv.close()
+                engine = "pdf2docx"
 
             # ── Step 3：ODT 格式（如需要） ────────────────────────
             if output_format == "odt":
-                proc = subprocess.run(
+                proc2 = subprocess.run(
                     ["libreoffice", "--headless", "--convert-to", "odt",
                      "--outdir", str(workdir), str(docx_path)],
-                    capture_output=True, timeout=120,
+                    capture_output=True, timeout=120, env=lo_env,
                 )
-                if proc.returncode != 0:
-                    raise Exception(f"LibreOffice 轉換失敗：{proc.stderr.decode()}")
+                if proc2.returncode != 0:
+                    raise Exception(f"ODT 轉換失敗：{proc2.stderr.decode()}")
                 output_path = workdir / f"{input_path.stem}.odt"
                 content_type = "application/vnd.oasis.opendocument.text"
             else:
