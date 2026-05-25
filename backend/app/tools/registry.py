@@ -1084,6 +1084,155 @@ class TranslateDocTool(ToolBase):
                                     "段落數":   str(len(chunks))})
 
 
+# ─── PDF 轉 PowerPoint ───────────────────────────────────────────────────────
+
+class PdfToPptxTool(ToolBase):
+    tool_id = "pdf-to-pptx"
+    name_zh = "PDF 轉 PowerPoint"
+    name_en = "PDF to PPTX"
+    description_zh = "將 PDF 每頁轉換為 PowerPoint 投影片（.pptx）"
+    category = "convert"
+    icon = "GalleryHorizontalEnd"
+    color = "orange"
+    tags = ["PDF", "轉換", "PowerPoint", "PPTX"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("dpi", "select", "投影片品質", required=False, default="150",
+                      options=[
+                          {"label": "標準（150 DPI，速度快）", "value": "150"},
+                          {"label": "高清（300 DPI，檔案較大）", "value": "300"},
+                      ]),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz, io
+            from pptx import Presentation
+            from pptx.util import Emu
+
+            dpi = int(params.get("dpi", 150))
+            scale = dpi / 72
+            mat = fitz.Matrix(scale, scale)
+
+            doc = fitz.open(str(input_path))
+            page_count = len(doc)
+            prs = Presentation()
+
+            # PDF point → EMU（1 pt = 914400/72 = 12700 EMU）
+            PT_TO_EMU = 914400 / 72
+            MAX_EMU   = 51206400   # PPTX 最大 56 英寸
+            MIN_EMU   = 914400     # PPTX 最小 1 英寸
+
+            first = doc[0]
+            raw_w = first.rect.width  * PT_TO_EMU
+            raw_h = first.rect.height * PT_TO_EMU
+            # 若超出上限則等比縮放
+            shrink = min(1.0, MAX_EMU / max(raw_w, raw_h, 1))
+            slide_w = Emu(max(MIN_EMU, int(raw_w * shrink)))
+            slide_h = Emu(max(MIN_EMU, int(raw_h * shrink)))
+
+            prs.slide_width  = slide_w
+            prs.slide_height = slide_h
+            blank_layout = prs.slide_layouts[6]
+
+            for i, page in enumerate(doc):
+                slide = prs.slides.add_slide(blank_layout)
+                pix = page.get_pixmap(matrix=mat)
+                buf = io.BytesIO(pix.tobytes("png"))
+                slide.shapes.add_picture(buf, 0, 0, slide_w, slide_h)
+
+            doc.close()
+            output_path = workdir / f"{input_path.stem}.pptx"
+            prs.save(str(output_path))
+
+            return ToolResult(
+                True, output_path, output_path.name,
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                metadata={"pages": page_count, "dpi": dpi},
+            )
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
+# ─── PDF 轉 Excel ────────────────────────────────────────────────────────────
+
+class PdfToExcelTool(ToolBase):
+    tool_id = "pdf-to-excel"
+    name_zh = "PDF 轉 Excel"
+    name_en = "PDF to Excel"
+    description_zh = "從 PDF 中自動擷取表格並輸出為 Excel 試算表（.xlsx）"
+    category = "convert"
+    icon = "Table"
+    color = "green"
+    tags = ["PDF", "轉換", "Excel", "表格"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("mode", "select", "擷取模式", required=False, default="table",
+                      options=[
+                          {"label": "自動偵測表格（推薦）", "value": "table"},
+                          {"label": "全部文字（依頁分頁）", "value": "text"},
+                      ]),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import pdfplumber
+            import openpyxl
+
+            mode = params.get("mode", "table")
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)   # 移除預設空白頁
+            total_tables = 0
+
+            with pdfplumber.open(str(input_path)) as pdf:
+                page_count = len(pdf.pages)
+                for pg_i, page in enumerate(pdf.pages):
+                    if mode == "table":
+                        tables = page.extract_tables()
+                        for t_i, table in enumerate(tables or []):
+                            name = f"P{pg_i+1}" if len(tables) == 1 else f"P{pg_i+1}-T{t_i+1}"
+                            ws = wb.create_sheet(title=name[:31])
+                            for row in table:
+                                ws.append([cell if cell is not None else "" for cell in row])
+                            total_tables += 1
+                    else:
+                        ws = wb.create_sheet(title=f"第{pg_i+1}頁"[:31])
+                        text = page.extract_text() or ""
+                        for line in text.split("\n"):
+                            ws.append([line])
+
+            # 表格模式但未找到表格 → fallback 文字模式
+            if mode == "table" and total_tables == 0:
+                import fitz
+                ws = wb.create_sheet(title="文字內容")
+                doc = fitz.open(str(input_path))
+                for i, page in enumerate(doc):
+                    ws.append([f"=== 第 {i+1} 頁 ==="])
+                    for line in page.get_text().split("\n"):
+                        ws.append([line])
+                    ws.append([""])
+                doc.close()
+                fallback_msg = "未偵測到表格，已改以文字模式輸出"
+            else:
+                fallback_msg = ""
+
+            output_path = workdir / f"{input_path.stem}.xlsx"
+            wb.save(str(output_path))
+
+            return ToolResult(
+                True, output_path, output_path.name,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                message=fallback_msg,
+                metadata={"pages": page_count, "tables": total_tables},
+            )
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
 # ─── 輔助函數 ────────────────────────────────────────────────────────────────
 
 def _parse_page_range(s: str, total: int) -> list[int]:
@@ -1328,6 +1477,7 @@ _register(
     PdfOcrTool(),
     # Convert
     PdfToImageTool(), ImageToPdfTool(), OfficeToPdfTool(), PdfToDocxTool(),
+    PdfToPptxTool(), PdfToExcelTool(),
     # Security
     DocDeidentTool(), AesZipTool(),
     # AI
