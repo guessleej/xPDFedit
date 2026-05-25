@@ -1129,7 +1129,7 @@ class PdfToDocxTool(ToolBase):
 
     async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
         try:
-            import subprocess
+            import subprocess, zipfile, re, io
             from pdf2docx import Converter
             import fitz
 
@@ -1138,14 +1138,78 @@ class PdfToDocxTool(ToolBase):
             end_p = int(params.get("end_page", 0))
             end = end_p if end_p > 0 else None
 
-            # Step 1：pdf2docx 轉成 .docx
-            docx_path = workdir / f"{input_path.stem}.docx"
-            cv = Converter(str(input_path))
-            cv.convert(str(docx_path), start=start, end=end)
-            cv.close()
+            # 取得原始 PDF 頁數與文字量（用來判斷轉換品質）
+            doc_ref = fitz.open(str(input_path))
+            page_count = len(doc_ref)
+            original_chars = sum(len(doc_ref[i].get_text()) for i in range(page_count))
+            doc_ref.close()
 
+            # ── Step 1：pdf2docx 嘗試轉換 ─────────────────────────
+            docx_path = workdir / f"{input_path.stem}.docx"
+            try:
+                cv = Converter(str(input_path))
+                cv.convert(str(docx_path), start=start, end=end)
+                cv.close()
+            except Exception as e:
+                logger.warning("pdf2docx 轉換失敗（%s），改用圖片嵌入模式", e)
+
+            # ── Step 2：檢查轉出品質 ──────────────────────────────
+            converted_chars = 0
+            if docx_path.exists():
+                try:
+                    with zipfile.ZipFile(str(docx_path)) as z:
+                        xml = z.read("word/document.xml").decode()
+                    texts = re.findall(r"<w:t[^>]*>([^<]+)</w:t>", xml)
+                    converted_chars = len("".join(texts).strip())
+                except Exception:
+                    pass
+
+            # 轉出字數不足原始的 30%（或 < 30 字），視為失敗 → 圖片嵌入模式
+            use_image = (
+                not docx_path.exists()
+                or converted_chars < 30
+                or (original_chars > 50 and converted_chars < original_chars * 0.3)
+            )
+
+            engine = "pdf2docx"
+            if use_image:
+                engine = "image-embed"
+                logger.info("PDF 轉 Word：改用圖片嵌入模式（原始 %d 字，轉出 %d 字）",
+                            original_chars, converted_chars)
+                from docx import Document as WordDoc
+                from docx.shared import Inches
+
+                doc_fitz = fitz.open(str(input_path))
+                word = WordDoc()
+                # 設定 A4 頁面，縮小邊距以容納整頁圖片
+                sec = word.sections[0]
+                sec.page_width  = Inches(8.27)
+                sec.page_height = Inches(11.69)
+                sec.left_margin = sec.right_margin = Inches(0.5)
+                sec.top_margin  = sec.bottom_margin = Inches(0.5)
+
+                start_idx = start
+                end_idx   = end if end is not None else page_count
+                indices   = list(range(start_idx, min(end_idx, page_count)))
+
+                for idx, pg_i in enumerate(indices):
+                    page = doc_fitz[pg_i]
+                    mat  = fitz.Matrix(2.0, 2.0)   # 144 DPI，品質足夠且不過大
+                    pix  = page.get_pixmap(matrix=mat)
+                    buf  = io.BytesIO(pix.tobytes("png"))
+
+                    para = word.add_paragraph()
+                    para.alignment = 1   # CENTER
+                    para.add_run().add_picture(buf, width=Inches(7.27))
+
+                    if idx < len(indices) - 1:
+                        word.add_page_break()
+
+                doc_fitz.close()
+                word.save(str(docx_path))
+
+            # ── Step 3：ODT 格式（如需要） ────────────────────────
             if output_format == "odt":
-                # Step 2：LibreOffice 將 .docx → .odt
                 proc = subprocess.run(
                     ["libreoffice", "--headless", "--convert-to", "odt",
                      "--outdir", str(workdir), str(docx_path)],
@@ -1159,13 +1223,9 @@ class PdfToDocxTool(ToolBase):
                 output_path = docx_path
                 content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-            doc = fitz.open(str(input_path))
-            page_count = len(doc)
-            doc.close()
-
             return ToolResult(
                 True, output_path, output_path.name, content_type,
-                metadata={"pages": page_count, "engine": "pdf2docx", "format": output_format},
+                metadata={"pages": page_count, "engine": engine, "format": output_format},
             )
         except Exception as e:
             return ToolResult(False, error=str(e))
