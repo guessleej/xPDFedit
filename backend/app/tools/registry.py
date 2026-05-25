@@ -1103,6 +1103,152 @@ def _parse_page_range(s: str, total: int) -> list[int]:
     return sorted(pages)
 
 
+# ─── PDF 轉 Word ─────────────────────────────────────────────────────────────
+
+class PdfToDocxTool(ToolBase):
+    tool_id = "pdf-to-docx"
+    name_zh = "PDF 轉 Word"
+    name_en = "PDF to Word"
+    description_zh = "將 PDF 轉換為可編輯的 Word（.docx）或 LibreOffice（.odt）文件"
+    category = "convert"
+    icon = "FileText"
+    color = "blue"
+    tags = ["PDF", "轉換", "Word", "DOCX"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("output_format", "select", "輸出格式", required=False, default="docx",
+                      options=[
+                          {"label": "DOCX（Microsoft Word）", "value": "docx"},
+                          {"label": "ODT（LibreOffice）",      "value": "odt"},
+                      ]),
+            ToolParam("start_page", "integer", "起始頁（留空=全部）", required=False, default=0, min_val=0),
+            ToolParam("end_page",   "integer", "結束頁（留空=全部）", required=False, default=0, min_val=0),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import subprocess
+            from pdf2docx import Converter
+            import fitz
+
+            output_format = params.get("output_format", "docx")
+            start = int(params.get("start_page", 0))
+            end_p = int(params.get("end_page", 0))
+            end = end_p if end_p > 0 else None
+
+            # Step 1：pdf2docx 轉成 .docx
+            docx_path = workdir / f"{input_path.stem}.docx"
+            cv = Converter(str(input_path))
+            cv.convert(str(docx_path), start=start, end=end)
+            cv.close()
+
+            if output_format == "odt":
+                # Step 2：LibreOffice 將 .docx → .odt
+                proc = subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "odt",
+                     "--outdir", str(workdir), str(docx_path)],
+                    capture_output=True, timeout=120,
+                )
+                if proc.returncode != 0:
+                    raise Exception(f"LibreOffice 轉換失敗：{proc.stderr.decode()}")
+                output_path = workdir / f"{input_path.stem}.odt"
+                content_type = "application/vnd.oasis.opendocument.text"
+            else:
+                output_path = docx_path
+                content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+            doc = fitz.open(str(input_path))
+            page_count = len(doc)
+            doc.close()
+
+            return ToolResult(
+                True, output_path, output_path.name, content_type,
+                metadata={"pages": page_count, "engine": "pdf2docx", "format": output_format},
+            )
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
+# ─── PDF OCR 文字辨識 ─────────────────────────────────────────────────────────
+
+class PdfOcrTool(ToolBase):
+    tool_id = "pdf-ocr"
+    name_zh = "PDF OCR 辨識"
+    name_en = "PDF OCR"
+    description_zh = "對掃描版 PDF 進行文字辨識（OCR），支援繁簡中文與英文"
+    category = "pdf"
+    icon = "ScanText"
+    color = "green"
+    tags = ["PDF", "OCR", "文字辨識", "掃描"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("language", "select", "辨識語言", required=False, default="chi_tra+eng",
+                      options=[
+                          {"label": "繁中 + 英文", "value": "chi_tra+eng"},
+                          {"label": "簡中 + 英文", "value": "chi_sim+eng"},
+                          {"label": "僅英文",       "value": "eng"},
+                      ]),
+            ToolParam("output_format", "select", "輸出格式", required=False, default="txt",
+                      options=[
+                          {"label": "純文字 (.txt)",  "value": "txt"},
+                          {"label": "Markdown (.md)", "value": "md"},
+                      ]),
+            ToolParam("dpi", "integer", "辨識解析度 DPI", required=False, default=300,
+                      min_val=150, max_val=600),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz
+            import pytesseract
+            from PIL import Image
+
+            language      = params.get("language", "chi_tra+eng")
+            output_format = params.get("output_format", "txt")
+            dpi           = int(params.get("dpi", 300))
+            scale         = dpi / 72
+            mat           = fitz.Matrix(scale, scale)
+
+            doc    = fitz.open(str(input_path))
+            pages  = len(doc)
+            blocks = []
+
+            for i, page in enumerate(doc):
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                text = pytesseract.image_to_string(
+                    img, lang=language,
+                    config="--oem 3 --psm 6",
+                ).strip()
+                if output_format == "md":
+                    blocks.append(f"## 第 {i + 1} 頁\n\n{text}\n")
+                else:
+                    blocks.append(f"{'=' * 40}\n第 {i + 1} 頁\n{'=' * 40}\n{text}\n")
+
+            doc.close()
+
+            ext = "md" if output_format == "md" else "txt"
+            output_path = workdir / f"{input_path.stem}_ocr.{ext}"
+            output_path.write_text("\n".join(blocks), encoding="utf-8")
+            content_type = "text/markdown" if output_format == "md" else "text/plain"
+
+            return ToolResult(
+                True, output_path, output_path.name, content_type,
+                metadata={
+                    "pages":      pages,
+                    "characters": sum(len(b) for b in blocks),
+                    "language":   language,
+                    "dpi":        dpi,
+                },
+            )
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
 # ─── 工具登錄 ────────────────────────────────────────────────────────────────
 
 TOOL_REGISTRY: dict[str, ToolBase] = {}
@@ -1119,8 +1265,9 @@ _register(
     PdfWatermarkTool(), PdfRotateTool(), PdfStampTool(), PdfNupTool(), PdfDiffTool(),
     PdfExtractTextTool(), PdfExtractImagesTool(), PdfMetadataTool(), PdfPagesTool(),
     PdfWordCountTool(), PdfHiddenScanTool(), PdfAnnotationsTool(), PdfPageNumberTool(),
+    PdfOcrTool(),
     # Convert
-    PdfToImageTool(), ImageToPdfTool(), OfficeToPdfTool(),
+    PdfToImageTool(), ImageToPdfTool(), OfficeToPdfTool(), PdfToDocxTool(),
     # Security
     DocDeidentTool(), AesZipTool(),
     # AI

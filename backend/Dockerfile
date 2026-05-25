@@ -25,6 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     curl \
     fonts-noto-cjk \
+    tesseract-ocr \
+    tesseract-ocr-chi-tra \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -fv
 
