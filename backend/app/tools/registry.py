@@ -1132,6 +1132,48 @@ class PdfToPptxTool(ToolBase):
 
 # ─── PDF 轉 Excel ────────────────────────────────────────────────────────────
 
+class PdfToTxtTool(ToolBase):
+    tool_id = "pdf-to-txt"
+    name_zh = "PDF 轉文字"
+    name_en = "PDF to TXT"
+    description_zh = "將 PDF 全部文字內容擷取為純文字檔（.txt），可直接編輯"
+    category = "convert"
+    icon = "FileType"
+    color = "slate"
+    tags = ["PDF", "轉換", "文字", "TXT"]
+
+    @property
+    def params(self):
+        return [
+            ToolParam("encoding", "select", "編碼", required=False, default="utf-8",
+                      options=[{"label": "UTF-8（推薦）", "value": "utf-8"},
+                               {"label": "Big5（繁中相容）", "value": "big5"}]),
+            ToolParam("page_separator", "boolean", "加入頁碼分隔線", required=False, default=True),
+        ]
+
+    async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
+        try:
+            import fitz
+            enc  = params.get("encoding", "utf-8")
+            sep  = params.get("page_separator", True)
+            doc  = fitz.open(str(input_path))
+            page_count = len(doc)
+            lines: list[str] = []
+            for i, page in enumerate(doc):
+                if sep:
+                    lines.append(f"{'─'*40}\n第 {i+1} 頁\n{'─'*40}")
+                lines.append(page.get_text().strip())
+            doc.close()
+            content = "\n\n".join(lines)
+            out_name = f"{input_path.stem}.txt"
+            out = workdir / out_name
+            out.write_text(content, encoding=enc, errors="replace")
+            return ToolResult(True, out, out_name, "text/plain",
+                              metadata={"pages": page_count, "characters": len(content), "encoding": enc})
+        except Exception as e:
+            return ToolResult(False, error=str(e))
+
+
 class PdfToExcelTool(ToolBase):
     tool_id = "pdf-to-excel"
     name_zh = "PDF 轉 Excel"
@@ -1821,8 +1863,8 @@ _register(
     PdfWordCountTool(), PdfHiddenScanTool(), PdfAnnotationsTool(), PdfPageNumberTool(),
     PdfOcrTool(),
     # Convert
-    PdfToImageTool(), ImageToPdfTool(), OfficeToPdfTool(), PdfToDocxTool(),
-    PdfToPptxTool(), PdfToExcelTool(),
+    PdfToImageTool(), ImageToPdfTool(), OfficeToPdfTool(),
+    PdfToDocxTool(), PdfToPptxTool(), PdfToTxtTool(), PdfToExcelTool(),
     # Security
     DocDeidentTool(), AesZipTool(),
     # AI
