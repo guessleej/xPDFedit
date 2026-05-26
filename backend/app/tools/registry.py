@@ -1826,63 +1826,80 @@ class PdfToDocxTool(ToolBase):
             return ToolResult(False, error=str(e))
 
 
-# ─── PDF OCR 文字辨識 ─────────────────────────────────────────────────────────
+# ─── PDF OCR 文字辨識（地端視覺模型） ────────────────────────────────────────
 
 class PdfOcrTool(ToolBase):
     tool_id = "pdf-ocr"
     name_zh = "PDF OCR 辨識"
     name_en = "PDF OCR"
-    description_zh = "對掃描版 PDF 進行文字辨識（OCR），支援繁簡中文與英文"
+    description_zh = "對掃描版 PDF 進行文字辨識，使用地端視覺 AI 模型（繁／簡中、英文）"
     category = "pdf"
     icon = "ScanText"
     color = "green"
-    tags = ["PDF", "OCR", "文字辨識", "掃描"]
+    tags = ["PDF", "OCR", "文字辨識", "掃描", "AI"]
 
     @property
     def params(self):
         return [
-            ToolParam("language", "select", "辨識語言", required=False, default="chi_tra+eng",
-                      options=[
-                          {"label": "繁中 + 英文", "value": "chi_tra+eng"},
-                          {"label": "簡中 + 英文", "value": "chi_sim+eng"},
-                          {"label": "僅英文",       "value": "eng"},
-                      ]),
             ToolParam("output_format", "select", "輸出格式", required=False, default="txt",
                       options=[
                           {"label": "純文字 (.txt)",  "value": "txt"},
                           {"label": "Markdown (.md)", "value": "md"},
                       ]),
-            ToolParam("dpi", "integer", "辨識解析度 DPI", required=False, default=300,
-                      min_val=150, max_val=600),
+            ToolParam("dpi", "integer", "渲染解析度 DPI", required=False, default=150,
+                      min_val=72, max_val=300),
         ]
 
     async def execute(self, input_path: Path, params: dict, workdir: Path) -> ToolResult:
         try:
             import fitz
-            import pytesseract
-            from PIL import Image
+            import base64
+            import httpx
+            from app.config import settings
 
-            language      = params.get("language", "chi_tra+eng")
             output_format = params.get("output_format", "txt")
-            dpi           = int(params.get("dpi", 300))
+            dpi           = int(params.get("dpi", 150))
             scale         = dpi / 72
             mat           = fitz.Matrix(scale, scale)
 
-            doc    = fitz.open(str(input_path))
-            pages  = len(doc)
-            blocks = []
+            model       = settings.ocr_model
+            ollama_base = settings.llm_base_url.rstrip("/").replace("/v1", "")
 
-            for i, page in enumerate(doc):
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                text = pytesseract.image_to_string(
-                    img, lang=language,
-                    config="--oem 3 --psm 6",
-                ).strip()
-                if output_format == "md":
-                    blocks.append(f"## 第 {i + 1} 頁\n\n{text}\n")
-                else:
-                    blocks.append(f"{'=' * 40}\n第 {i + 1} 頁\n{'=' * 40}\n{text}\n")
+            doc   = fitz.open(str(input_path))
+            pages = len(doc)
+            blocks: list[str] = []
+
+            prompt = (
+                "請將圖片中所有可見文字完整辨識出來，按原始排版順序輸出。"
+                "不要加任何說明、標題或前言，直接輸出文字內容。"
+            )
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                for i, page in enumerate(doc):
+                    # 渲染頁面為 PNG
+                    pix     = page.get_pixmap(matrix=mat)
+                    img_b64 = base64.b64encode(pix.tobytes("png")).decode()
+
+                    resp = await client.post(
+                        f"{ollama_base}/api/chat",
+                        json={
+                            "model": model,
+                            "stream": False,
+                            "messages": [{
+                                "role": "user",
+                                "content": prompt,
+                                "images": [img_b64],
+                            }],
+                        },
+                    )
+                    resp.raise_for_status()
+                    text = resp.json()["message"]["content"].strip()
+
+                    if output_format == "md":
+                        blocks.append(f"## 第 {i + 1} 頁\n\n{text}\n")
+                    else:
+                        sep = "=" * 40
+                        blocks.append(f"{sep}\n第 {i + 1} 頁\n{sep}\n{text}\n")
 
             doc.close()
 
@@ -1890,13 +1907,14 @@ class PdfOcrTool(ToolBase):
             output_path = workdir / f"{input_path.stem}_ocr.{ext}"
             output_path.write_text("\n".join(blocks), encoding="utf-8")
             content_type = "text/markdown" if output_format == "md" else "text/plain"
+            total_chars  = sum(len(b) for b in blocks)
 
             return ToolResult(
                 True, output_path, output_path.name, content_type,
                 metadata={
                     "pages":      pages,
-                    "characters": sum(len(b) for b in blocks),
-                    "language":   language,
+                    "characters": total_chars,
+                    "model":      model,
                     "dpi":        dpi,
                 },
             )

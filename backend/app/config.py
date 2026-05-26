@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     rag_model: str = "qwen3.6:35b"         # PDF 問答（推理強）
     summary_model: str = "gemma4:e4b"       # 摘要 / 關鍵字（快）
     embedding_model: str = "bge-m3:latest"  # 向量化
+    ocr_model: str = "gemma4:e4b"           # 地端視覺 OCR
 
 
 @lru_cache
