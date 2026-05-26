@@ -1716,35 +1716,91 @@ class PdfToDocxTool(ToolBase):
             import fitz
 
             output_format = params.get("output_format", "docx")
-
-            doc_ref = fitz.open(str(input_path))
-            page_count = len(doc_ref)
-            doc_ref.close()
-
             lo_env = {**os.environ, "HOME": "/tmp"}
             docx_path = workdir / f"{input_path.stem}.docx"
 
-            # ── Step 1：LibreOffice PDF 匯入濾鏡（可編輯文字/圖形） ──
-            proc = subprocess.run(
-                ["libreoffice", "--headless",
-                 "--infilter=writer_pdf_import",
-                 "--convert-to", "docx",
-                 "--outdir", str(workdir),
-                 str(input_path)],
-                capture_output=True, timeout=180, env=lo_env,
-            )
-            engine = "libreoffice"
+            # ── 分析來源 PDF ──────────────────────────────────────────
+            doc_src = fitz.open(str(input_path))
+            page_count = len(doc_src)
+            src_text = "".join(page.get_text() for page in doc_src)
+            doc_src.close()
+            src_text_len = len(src_text.strip())
+            is_text_based = src_text_len > 100   # 判斷是否為可萃取文字的 PDF
 
-            # ── Step 2：LibreOffice 失敗則 fallback pdf2docx ────────
-            if proc.returncode != 0 or not docx_path.exists():
-                logger.warning("LibreOffice 轉換失敗，改用 pdf2docx")
-                from pdf2docx import Converter
-                cv = Converter(str(input_path))
-                cv.convert(str(docx_path))
-                cv.close()
-                engine = "pdf2docx"
+            engine = ""
 
-            # ── Step 3：ODT 格式（如需要） ────────────────────────
+            def _docx_text_len(path: Path) -> int:
+                """量測 DOCX 實際文字量（排除圖片佔位）"""
+                try:
+                    from docx import Document as _Doc
+                    d = _Doc(str(path))
+                    return sum(len(p.text.strip()) for p in d.paragraphs)
+                except Exception:
+                    return 0
+
+            # ── Strategy 1：pdf2docx（文字型 PDF 最佳保版面） ─────────
+            if is_text_based and not engine:
+                try:
+                    from pdf2docx import Converter
+                    cv = Converter(str(input_path))
+                    cv.convert(str(docx_path))
+                    cv.close()
+                    out_len = _docx_text_len(docx_path)
+                    threshold = max(50, src_text_len * 0.10)
+                    if out_len >= threshold:
+                        engine = "pdf2docx"
+                        logger.info("pdf2docx 成功：%d 字元", out_len)
+                    else:
+                        logger.warning("pdf2docx 輸出文字不足（%d/%d），改用其他引擎", out_len, src_text_len)
+                        docx_path.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning("pdf2docx 失敗：%s", e)
+                    if docx_path.exists():
+                        docx_path.unlink()
+
+            # ── Strategy 2：LibreOffice writer_pdf_import ────────────
+            if not engine:
+                proc = subprocess.run(
+                    ["libreoffice", "--headless",
+                     "--infilter=writer_pdf_import",
+                     "--convert-to", "docx",
+                     "--outdir", str(workdir),
+                     str(input_path)],
+                    capture_output=True, timeout=180, env=lo_env,
+                )
+                if proc.returncode == 0 and docx_path.exists():
+                    lo_len = _docx_text_len(docx_path)
+                    threshold = max(30, src_text_len * 0.05)
+                    if lo_len >= threshold:
+                        engine = "libreoffice"
+                        logger.info("LibreOffice 成功：%d 字元", lo_len)
+                    else:
+                        logger.warning("LibreOffice 輸出幾乎全為圖片（%d 字元），改用文字萃取", lo_len)
+                        docx_path.unlink(missing_ok=True)
+
+            # ── Strategy 3：純文字萃取 → python-docx（保底，必成功） ──
+            if not engine:
+                from docx import Document as _Doc
+                doc_out = _Doc()
+                doc_out.core_properties.title = input_path.stem
+                src2 = fitz.open(str(input_path))
+                for pg_num, pg in enumerate(src2, 1):
+                    blocks = pg.get_text("blocks")
+                    blocks_sorted = sorted(blocks, key=lambda b: (round(b[1] / 20), b[0]))
+                    page_has_content = False
+                    for b in blocks_sorted:
+                        txt = b[4].strip()
+                        if txt:
+                            doc_out.add_paragraph(txt)
+                            page_has_content = True
+                    if page_has_content and pg_num < len(src2):
+                        doc_out.add_page_break()
+                src2.close()
+                doc_out.save(str(docx_path))
+                engine = "text-extract"
+                logger.info("text-extract 完成：%d 字元", _docx_text_len(docx_path))
+
+            # ── ODT 格式（如需要） ────────────────────────────────────
             if output_format == "odt":
                 proc2 = subprocess.run(
                     ["libreoffice", "--headless", "--convert-to", "odt",
@@ -1759,9 +1815,12 @@ class PdfToDocxTool(ToolBase):
                 output_path = docx_path
                 content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
+            final_chars = _docx_text_len(output_path)
             return ToolResult(
                 True, output_path, output_path.name, content_type,
-                metadata={"pages": page_count, "engine": engine, "format": output_format},
+                metadata={"pages": page_count, "engine": engine,
+                          "source_chars": src_text_len, "output_chars": final_chars,
+                          "format": output_format},
             )
         except Exception as e:
             return ToolResult(False, error=str(e))
