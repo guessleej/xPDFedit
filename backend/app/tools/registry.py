@@ -1706,6 +1706,8 @@ class PdfToDocxTool(ToolBase):
                           {"label": "DOCX（Microsoft Word）", "value": "docx"},
                           {"label": "ODT（LibreOffice）",      "value": "odt"},
                       ]),
+            ToolParam("ai_cleanup", "boolean", "AI 清理（移除網頁選單/Cookie 等雜訊，重整結構）",
+                      required=False, default=False),
             ToolParam("start_page", "integer", "起始頁（留空=全部）", required=False, default=0, min_val=0),
             ToolParam("end_page",   "integer", "結束頁（留空=全部）", required=False, default=0, min_val=0),
         ]
@@ -1714,6 +1716,7 @@ class PdfToDocxTool(ToolBase):
         try:
             import subprocess, os
             import fitz
+            from app.config import settings
 
             output_format = params.get("output_format", "docx")
             lo_env = {**os.environ, "HOME": "/tmp"}
@@ -1799,6 +1802,57 @@ class PdfToDocxTool(ToolBase):
                 doc_out.save(str(docx_path))
                 engine = "text-extract"
                 logger.info("text-extract 完成：%d 字元", _docx_text_len(docx_path))
+
+            # ── AI 清理（可選）：移除網頁雜訊，重整文件結構 ──────────
+            ai_cleanup = str(params.get("ai_cleanup", "false")).lower() in ("true", "1", "yes")
+            if ai_cleanup and docx_path.exists():
+                try:
+                    raw_text = "\n".join(
+                        p.text.strip()
+                        for p in __import__("docx").Document(str(docx_path)).paragraphs
+                        if p.text.strip()
+                    )
+                    clean_md = await _llm_chat(
+                        system=(
+                            "你是文件整理助手。使用者從 PDF 萃取了原始文字，"
+                            "可能包含網頁導航選單、Cookie 通知、頁尾連結、廣告按鈕等與主要內容無關的雜訊。\n"
+                            "請：\n"
+                            "1. 識別並保留主要內容（規格、說明、表格等）\n"
+                            "2. 移除：導航選單、Cookie/隱私通知、「立刻選購」等按鈕、頁尾版權、重複片段\n"
+                            "3. 以清晰的 Markdown 格式重整（# 標題、- 列表、| 表格）\n"
+                            "4. 只輸出整理後的內容，不加任何說明或前言"
+                        ),
+                        user=raw_text,
+                        model=settings.summary_model,
+                    )
+                    # 將 Markdown 寫回 DOCX
+                    from docx import Document as _Doc2
+                    from docx.shared import Pt
+                    doc_clean = _Doc2()
+                    for line in clean_md.splitlines():
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.startswith("### "):
+                            p = doc_clean.add_heading(stripped[4:], level=3)
+                        elif stripped.startswith("## "):
+                            p = doc_clean.add_heading(stripped[3:], level=2)
+                        elif stripped.startswith("# "):
+                            p = doc_clean.add_heading(stripped[2:], level=1)
+                        elif stripped.startswith("- ") or stripped.startswith("* "):
+                            doc_clean.add_paragraph(stripped[2:], style="List Bullet")
+                        elif stripped.startswith("|"):
+                            # 簡單表格列 → 段落（完整表格解析留給進階版）
+                            cells = [c.strip() for c in stripped.strip("|").split("|")]
+                            doc_clean.add_paragraph("  |  ".join(cells))
+                        else:
+                            doc_clean.add_paragraph(stripped)
+                    docx_path.unlink(missing_ok=True)
+                    doc_clean.save(str(docx_path))
+                    engine += "+ai_cleanup"
+                    logger.info("AI 清理完成")
+                except Exception as e:
+                    logger.warning("AI 清理失敗，保留原始輸出：%s", e)
 
             # ── ODT 格式（如需要） ────────────────────────────────────
             if output_format == "odt":
