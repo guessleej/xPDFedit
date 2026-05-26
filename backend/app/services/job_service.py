@@ -72,13 +72,13 @@ async def create_job(
     await db.refresh(job)
 
     # 建立 asyncio Task 並追蹤
-    task = asyncio.create_task(_run_job(job_id, tool_id, input_path, params))
+    task = asyncio.create_task(_run_job(job_id, tool_id, input_path, params, input_filename))
     _running_tasks[job_id] = task
     task.add_done_callback(lambda t: _running_tasks.pop(job_id, None))
     return job
 
 
-async def _run_job(job_id: str, tool_id: str, input_path: str, params: dict):
+async def _run_job(job_id: str, tool_id: str, input_path: str, params: dict, input_filename: str = ""):
     """在 ThreadPoolExecutor 中執行工具，支援 asyncio 取消"""
     from ..database import AsyncSessionLocal
 
@@ -131,7 +131,18 @@ async def _run_job(job_id: str, tool_id: str, input_path: str, params: dict):
         if result.success and result.output_path:
             out_dir = OUTPUT_DIR / job_id
             out_dir.mkdir(parents=True, exist_ok=True)
-            dest = out_dir / (result.output_filename or result.output_path.name)
+
+            # 把工具產生的 UUID 檔名換回原始上傳檔名
+            raw_name = result.output_filename or result.output_path.name
+            if input_filename:
+                uuid_stem  = Path(input_path).stem          # e.g. "abc123"
+                orig_stem  = Path(input_filename).stem       # e.g. "東海大學架構"
+                # 只替換 UUID 部分，保留工具加的前綴（如 "compressed_"）
+                friendly   = raw_name.replace(uuid_stem, orig_stem)
+            else:
+                friendly   = raw_name
+
+            dest = out_dir / friendly
             shutil.copy2(str(result.output_path), str(dest))
             await _set_job(
                 status="done",
