@@ -48,7 +48,11 @@ async def _do_cleanup(db: AsyncSession) -> dict:
 
     count = len(expired)
     if count:
-        await db.execute(delete(Job).where(Job.expires_at <= now))
+        # synchronize_session=False：跳過 ORM in-memory evaluator
+        # （SQLite 存 naive datetime，Python 比較時與 UTC-aware now 型別衝突）
+        await db.execute(
+            delete(Job).where(Job.expires_at <= now).execution_options(synchronize_session=False)
+        )
         await db.commit()
         logger.info("過期清理完成：%d 筆作業、%d 個檔案已刪除", count, freed)
     else:

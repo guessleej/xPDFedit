@@ -11,6 +11,7 @@ TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 @pytest_asyncio.fixture(scope="function")
 async def engine():
     from app.database import Base
+    import app.models  # 確保所有 model 已 import，Base.metadata 才包含所有 table  # noqa
     eng = create_async_engine(TEST_DB_URL, echo=False)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
