@@ -55,7 +55,7 @@ async def client(engine):
 async def admin_token(client):
     """取得 admin JWT token"""
     resp = await client.post("/api/v1/auth/login", json={
-        "username": "admin", "password": "admin", "realm": "local"
+        "username": "admin", "password": "admin1234", "realm": "local"
     })
     assert resp.status_code == 200, resp.text
     return resp.json()["access_token"]

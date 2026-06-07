@@ -52,7 +52,7 @@ class TestCleanup:
         expired = await _insert_job(db, timedelta(seconds=-1))
         fresh   = await _insert_job(db, timedelta(days=7))
 
-        result = await cleanup_expired()
+        result = await cleanup_expired(db)
 
         assert result["deleted_jobs"] >= 1
 
@@ -90,7 +90,7 @@ class TestCleanup:
         await db.commit()
 
         assert fake_input.exists()
-        await cleanup_expired()
+        await cleanup_expired(db)
         assert not fake_input.exists()
 
     async def test_not_expired_job_preserved(self, db):
@@ -100,7 +100,7 @@ class TestCleanup:
 
         fresh = await _insert_job(db, timedelta(days=3))
 
-        await cleanup_expired()
+        await cleanup_expired(db)
 
         found = (await db.execute(select(Job).where(Job.id == fresh.id))).scalar_one_or_none()
         assert found is not None
@@ -110,8 +110,8 @@ class TestCleanup:
         from app.core.cleanup import cleanup_expired
 
         await _insert_job(db, timedelta(seconds=-1))
-        r1 = await cleanup_expired()
-        r2 = await cleanup_expired()  # 第二次應無作業可刪
+        r1 = await cleanup_expired(db)
+        r2 = await cleanup_expired(db)  # 第二次應無作業可刪
 
         assert r1["deleted_jobs"] >= 1
         assert r2["deleted_jobs"] == 0
