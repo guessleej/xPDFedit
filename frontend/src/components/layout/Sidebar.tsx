@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, Wrench, ClipboardList,
-  Settings, LogOut, User,
+  Settings, LogOut, User, Search,
 } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { authApi } from '../../lib/api'
@@ -12,6 +12,7 @@ const NAV = [
   { to: '/',        icon: LayoutDashboard, label: '儀表板' },
   { to: '/tools',   icon: Wrench,          label: '工具箱' },
   { to: '/jobs',    icon: ClipboardList,   label: '我的作業' },
+  { to: '/search',  icon: Search,          label: '語意搜尋' },
 ]
 
 const ADMIN_NAV = [

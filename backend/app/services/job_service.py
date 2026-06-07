@@ -10,7 +10,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
+from fastapi import HTTPException
 
 from ..models.job import Job
 from ..models.user import User
@@ -54,6 +55,24 @@ async def create_job(
     priority: int = 5,
 ) -> Job:
     _ensure_dirs()
+
+    # ── 每日配額檢查 ─────────────────────────────────────────────
+    if user.daily_limit is not None:
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_count = (await db.execute(
+            select(func.count()).where(
+                Job.user_id == user.id,
+                Job.queued_at >= today_start,
+            )
+        )).scalar_one()
+        if today_count >= user.daily_limit:
+            raise HTTPException(
+                status_code=429,
+                detail=f"已達今日作業上限（每日限制 {user.daily_limit} 件，今日已提交 {today_count} 件）",
+            )
+
     job_id = str(uuid.uuid4())
     expires_at = datetime.now(timezone.utc) + timedelta(days=settings.file_retention_days)
     job = Job(

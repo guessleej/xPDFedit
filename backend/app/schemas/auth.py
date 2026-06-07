@@ -50,6 +50,7 @@ class UserUpdate(BaseModel):
     password: str | None = None
     enabled: bool | None = None
     roles: list[str] | None = None
+    daily_limit: int | None = None  # -1 = 清除限制，>0 = 設定每日上限
 
 
 class APITokenCreate(BaseModel):

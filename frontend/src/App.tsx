@@ -8,6 +8,7 @@ import { Tools } from './pages/Tools'
 import { ToolExecute } from './pages/ToolExecute'
 import { Jobs } from './pages/Jobs'
 import { Admin } from './pages/Admin'
+import { Search } from './pages/Search'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -29,6 +30,7 @@ export default function App() {
             <Route path="/tools" element={<Tools />} />
             <Route path="/tools/:toolId" element={<ToolExecute />} />
             <Route path="/jobs" element={<Jobs />} />
+            <Route path="/search" element={<Search />} />
             <Route path="/admin" element={<Admin />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -9,6 +10,7 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .database import init_db, AsyncSessionLocal
 from .core.init_data import seed_database
+from .core.cleanup import run_cleanup_scheduler
 from .routers import auth, tools, jobs, admin, search
 
 logging.basicConfig(level=logging.DEBUG if settings.debug else logging.INFO,
@@ -23,7 +25,14 @@ async def lifespan(app: FastAPI):
     async with AsyncSessionLocal() as db:
         await seed_database(db)
     logger.info("資料庫初始化完成，工具數量: %d", len(tools.TOOL_REGISTRY))
+
+    # 背景清理排程（每小時清除過期作業與檔案）
+    _cleanup_task = asyncio.create_task(run_cleanup_scheduler())
+    logger.info("過期清理排程已啟動")
+
     yield
+
+    _cleanup_task.cancel()
     logger.info("xPDFedit 關閉")
 
 

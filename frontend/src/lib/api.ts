@@ -162,3 +162,32 @@ export const adminApi = {
 export const realmApi = {
   listPublic: () => api.get<{ name: string; type: string; label: string }[]>('/auth/realms').then(r => r.data),
 }
+
+// ── Semantic Search ────────────────────────────────────────────────────────────
+export interface SemanticResult {
+  filename: string
+  page: number
+  chunk: number
+  text: string
+  score: number
+}
+
+export interface SemanticSearchResponse {
+  query: string
+  results: SemanticResult[]
+  total: number
+}
+
+export interface IndexStats {
+  files: { filename: string; chunks: number }[]
+  total_chunks: number
+  index: string
+}
+
+export const searchApi = {
+  semantic: (q: string, topK = 10, filename?: string) =>
+    api.get<SemanticSearchResponse>('/search/semantic', {
+      params: { q, top_k: topK, ...(filename ? { filename } : {}) },
+    }).then(r => r.data),
+  stats: () => api.get<IndexStats>('/search/semantic/stats').then(r => r.data),
+}

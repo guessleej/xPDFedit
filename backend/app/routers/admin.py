@@ -86,6 +86,7 @@ async def list_users(
             "display_name": u.display_name, "email": u.email,
             "roles": roles, "is_superadmin": u.is_superadmin,
             "enabled": u.enabled,
+            "daily_limit": u.daily_limit,
             "last_login": u.last_login.isoformat() if u.last_login else None,
             "created_at": u.created_at.isoformat(),
         }
@@ -143,6 +144,9 @@ async def update_user(user_id: int, req: UserUpdate, user: CurrentUser, db: Asyn
         updates["password_hash"] = hash_password(req.password)
     if req.enabled is not None:
         updates["enabled"] = req.enabled
+    if req.daily_limit is not None:
+        # -1 表示清除限制（設為 NULL）
+        updates["daily_limit"] = None if req.daily_limit < 0 else req.daily_limit
 
     if updates:
         await db.execute(update(User).where(User.id == user_id).values(**updates))
@@ -455,3 +459,14 @@ async def system_health():
         "timestamp": datetime.utcnow().isoformat(),
         "tools_loaded": len(TOOL_REGISTRY),
     }
+
+
+# ─── 手動觸發過期清理 ──────────────────────────────────────────────────────────
+
+@router.post("/system/cleanup")
+async def trigger_cleanup(user: CurrentUser):
+    """立即執行一次過期作業清理（管理員用）"""
+    _require_admin(user)
+    from ..core.cleanup import cleanup_expired
+    result = await cleanup_expired()
+    return {"message": "清理完成", **result}

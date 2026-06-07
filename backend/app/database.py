@@ -24,3 +24,12 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 安全遷移：補上新欄位（冪等，欄位已存在時靜默略過）
+        from sqlalchemy import text
+        for stmt in [
+            "ALTER TABLE users ADD COLUMN daily_limit INTEGER",
+        ]:
+            try:
+                await conn.execute(text(stmt))
+            except Exception:
+                pass
