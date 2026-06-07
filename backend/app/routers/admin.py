@@ -464,9 +464,9 @@ async def system_health():
 # ─── 手動觸發過期清理 ──────────────────────────────────────────────────────────
 
 @router.post("/system/cleanup")
-async def trigger_cleanup(user: CurrentUser):
+async def trigger_cleanup(user: CurrentUser, db: AsyncSession = Depends(get_db)):
     """立即執行一次過期作業清理（管理員用）"""
     _require_admin(user)
     from ..core.cleanup import cleanup_expired
-    result = await cleanup_expired()
+    result = await cleanup_expired(db)
     return {"message": "清理完成", **result}
