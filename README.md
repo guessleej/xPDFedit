@@ -19,7 +19,8 @@ docker compose up -d
 open http://localhost
 ```
 
-預設帳號：`admin` / `admin1234`
+預設帳號 `admin`，密碼取自 `ADMIN_PASSWORD` 環境變數；未設定時會在首次啟動的日誌
+印出一組隨機密碼（只印一次），登入後請立即修改。
 
 ---
 

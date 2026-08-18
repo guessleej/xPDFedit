@@ -224,16 +224,6 @@ export function Login() {
                 }
               </button>
             </form>
-
-            {/* 預設帳號 */}
-            <div className="mt-6 pt-5 border-t border-slate-100">
-              <p className="text-[11px] text-slate-400 text-center">
-                預設&ensp;
-                <code className="font-mono text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded text-[10px]">admin</code>
-                &ensp;/&ensp;
-                <code className="font-mono text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded text-[10px]">admin1234</code>
-              </p>
-            </div>
           </div>
 
           {/* 底部空白 */}

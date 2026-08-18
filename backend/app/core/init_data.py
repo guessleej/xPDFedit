@@ -1,5 +1,7 @@
 """初始化資料庫預設資料（Realm, Roles, 預設管理員）"""
 from __future__ import annotations
+import os
+import secrets
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -42,13 +44,21 @@ async def seed_database(db: AsyncSession) -> None:
 
     await db.flush()
 
-    # 建立預設管理員帳號 admin / admin1234
+    # 建立預設管理員帳號 admin。密碼取自 ADMIN_PASSWORD 環境變數；
+    # 未設定則隨機產生並印在啟動日誌，不使用固定預設值。
     result = await db.execute(select(User).where(User.username == "admin"))
     if not result.scalar_one_or_none():
+        admin_password = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(12)
+        if not os.environ.get("ADMIN_PASSWORD"):
+            print(
+                "[init] 已建立預設管理員 admin，隨機密碼："
+                f"{admin_password}（僅顯示這一次，請立即登入後修改）",
+                flush=True,
+            )
         admin = User(
             username="admin",
             realm_id=local_realm.id,
-            password_hash=hash_password("admin1234"),
+            password_hash=hash_password(admin_password),
             display_name="系統管理員",
             email="admin@cloudinfo.com.tw",
             is_superadmin=True,

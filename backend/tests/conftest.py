@@ -1,5 +1,9 @@
 """pytest fixtures — in-memory SQLite + 完整 app 依賴覆寫"""
 from __future__ import annotations
+import os
+
+# init_data 在建立預設 admin 時會讀這個變數，必須在匯入 app 之前設定
+os.environ.setdefault("ADMIN_PASSWORD", "test-admin-password")
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -56,7 +60,9 @@ async def client(engine):
 async def admin_token(client):
     """取得 admin JWT token"""
     resp = await client.post("/api/v1/auth/login", json={
-        "username": "admin", "password": "admin1234", "realm": "local"
+        "username": "admin",
+        "password": os.environ["ADMIN_PASSWORD"],
+        "realm": "local",
     })
     assert resp.status_code == 200, resp.text
     return resp.json()["access_token"]
